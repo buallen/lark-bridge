@@ -1,8 +1,11 @@
 'use strict';
 
-// Load .env if present
+const lark = require('@larksuiteoapi/node-sdk');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+
+// Load .env if present
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
   fs.readFileSync(envPath, 'utf8').split('\n').forEach(line => {
@@ -11,15 +14,11 @@ if (fs.existsSync(envPath)) {
   });
 }
 
-const lark = require('@larksuiteoapi/node-sdk');
-const { spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs');
-
 // ── Config ────────────────────────────────────────────────────────────────────
 const APP_ID = process.env.LARK_APP_ID;
 const APP_SECRET = process.env.LARK_APP_SECRET;
 const DEFAULT_WORKDIR = process.env.WORKDIR || '/Users/kan.lu/Documents/GitHub';
+const STATE_FILE = path.join(__dirname, '.state.json');
 
 if (!APP_ID || !APP_SECRET) {
   console.error('❌ Missing LARK_APP_ID or LARK_APP_SECRET environment variables.');
@@ -63,9 +62,36 @@ const apiClient = new lark.Client({
   loggerLevel: lark.LoggerLevel.warn,
 });
 
-// ── Per-user state ────────────────────────────────────────────────────────────
+// ── Processed message deduplication ──────────────────────────────────────────
+// Prevents Lark WebSocket re-delivery from processing the same message twice
+const processedMsgIds = new Set();
+const MAX_PROCESSED_IDS = 1000; // cap memory usage
+
+// ── Per-user state (persisted across restarts) ────────────────────────────────
 // key: open_id, value: { workdir, sessionId, running }
 const userState = new Map();
+
+function loadState() {
+  try {
+    const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(data)) {
+      userState.set(k, { workdir: v.workdir || DEFAULT_WORKDIR, sessionId: v.sessionId || null, running: false });
+    }
+    console.log('[state] loaded', userState.size, 'users from', STATE_FILE);
+  } catch (_) {}
+}
+
+function saveState() {
+  try {
+    const data = {};
+    for (const [k, v] of userState.entries()) {
+      data[k] = { workdir: v.workdir, sessionId: v.sessionId };
+    }
+    fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('[state] save error:', e.message);
+  }
+}
 
 function getState(openId) {
   if (!userState.has(openId)) {
@@ -74,23 +100,28 @@ function getState(openId) {
   return userState.get(openId);
 }
 
+loadState();
+
 // ── Session ID helpers ────────────────────────────────────────────────────────
-// Encode workdir to claude's project folder name: /Users/x/foo → -Users-x-foo
+// Encode workdir to claude's project folder name: /Users/x.y/foo → -Users-x-y-foo
+// Claude replaces both '/' and '.' with '-'
 function encodeWorkdir(dir) {
-  return dir.replace(/\//g, '-');
+  return dir.replace(/[/.]/g, '-');
 }
 
-// Find the newest session JSONL in claude's project directory for a given workdir
-function findLatestSessionId(workdir) {
+// Find session JSONL created AFTER a given timestamp (for tracking new sessions)
+// Uses birthtime (creation time) to avoid picking up existing sessions modified by other processes
+function findNewSessionId(workdir, afterMs) {
   const projectDir = path.join(CLAUDE_SESSIONS_BASE, encodeWorkdir(workdir));
   try {
     const files = fs.readdirSync(projectDir)
       .filter(f => f.endsWith('.jsonl'))
-      .map(f => ({
-        name: f,
-        mtime: fs.statSync(path.join(projectDir, f)).mtimeMs,
-      }))
-      .sort((a, b) => b.mtime - a.mtime);
+      .map(f => {
+        const stat = fs.statSync(path.join(projectDir, f));
+        return { name: f, btime: stat.birthtimeMs, mtime: stat.mtimeMs };
+      })
+      .filter(f => f.btime >= afterMs) // only files born after we started
+      .sort((a, b) => b.btime - a.btime);
     if (files.length > 0) return path.basename(files[0].name, '.jsonl');
   } catch (_) {}
   return null;
@@ -102,14 +133,21 @@ async function reply(chatId, text) {
   const chunks = [];
   for (let i = 0; i < text.length; i += CHUNK) chunks.push(text.slice(i, i + CHUNK));
   for (const chunk of chunks) {
-    await apiClient.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        content: JSON.stringify({ text: chunk }),
-        msg_type: 'text',
-      },
-    });
+    try {
+      const res = await apiClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({ text: chunk }),
+          msg_type: 'text',
+        },
+      });
+      if (res.code !== 0) {
+        console.error('[reply error] code:', res.code, 'msg:', res.msg);
+      }
+    } catch (e) {
+      console.error('[reply exception]', e.message, e.response?.data);
+    }
   }
 }
 
@@ -177,11 +215,40 @@ const HELP_TEXT = `🤖 Claude Code Bot
   what files did you just change?`;
 
 async function handleMessage(data) {
+  try {
   const msg = data.message;
+  const msgId = msg?.message_id;
+
+  // Deduplicate: skip if we've already processed this message_id
+  if (msgId) {
+    if (processedMsgIds.has(msgId)) {
+      console.log('[msg] duplicate, skip:', msgId);
+      return;
+    }
+    processedMsgIds.add(msgId);
+    // Keep set size bounded
+    if (processedMsgIds.size > MAX_PROCESSED_IDS) {
+      const first = processedMsgIds.values().next().value;
+      processedMsgIds.delete(first);
+    }
+  }
+
+  // Filter out messages older than 60 seconds (handles WS reconnect replay)
+  const msgTime = Number(msg?.create_time);
+  const age = msgTime ? Date.now() - msgTime : 0;
+  if (msgTime && age > 60_000) {
+    console.log('[msg] skipping old message, age:', Math.round(age/1000), 's, id:', msgId);
+    return;
+  }
+
   const openId = data.sender?.sender_id?.open_id;
   const chatId = msg?.chat_id;
+  console.log('[msg] chatId:', chatId, 'openId:', openId, 'type:', msg?.message_type, 'msgId:', msgId, 'age:', Math.round(age/1000)+'s');
 
-  if (!chatId || !openId) return;
+  if (!chatId || !openId) {
+    console.log('[msg] missing chatId or openId, skip.');
+    return;
+  }
   if (msg.message_type !== 'text') {
     await reply(chatId, '⚠️ Only text messages are supported.');
     return;
@@ -205,6 +272,7 @@ async function handleMessage(data) {
 
   if (text === 'new') {
     state.sessionId = null;
+    saveState();
     await reply(chatId, '🆕 Started a new conversation. Context has been cleared.');
     return;
   }
@@ -215,6 +283,7 @@ async function handleMessage(data) {
     if (fs.existsSync(newDir) && fs.statSync(newDir).isDirectory()) {
       state.workdir = newDir;
       state.sessionId = null; // new workdir = new session context
+      saveState();
       await reply(chatId, `✅ Working directory: \`${newDir}\`\n(Context reset for new directory)`);
     } else {
       await reply(chatId, `❌ Directory not found: \`${newDir}\``);
@@ -234,16 +303,18 @@ async function handleMessage(data) {
   await reply(chatId, `🔄 Running in \`${state.workdir}\` ${sessionLabel}…`);
 
   try {
+    const startMs = Date.now();
     const result = await runClaude(text, state.workdir, state.sessionId);
 
     // After first run, capture session ID so next message can resume it
     if (!state.sessionId) {
-      const newId = findLatestSessionId(state.workdir);
+      const newId = findNewSessionId(state.workdir, startMs);
       if (newId) {
         state.sessionId = newId;
         console.log(`[${openId}] New session started: ${newId}`);
       }
     }
+    saveState();
 
     await reply(chatId, result);
   } catch (err) {
@@ -252,9 +323,11 @@ async function handleMessage(data) {
       console.log(`[${openId}] Session ${state.sessionId} not found, starting fresh`);
       state.sessionId = null;
       try {
+        const startMs = Date.now();
         const result = await runClaude(text, state.workdir, null);
-        const newId = findLatestSessionId(state.workdir);
+        const newId = findNewSessionId(state.workdir, startMs);
         if (newId) state.sessionId = newId;
+        saveState();
         await reply(chatId, result);
       } catch (err2) {
         await reply(chatId, `❌ Error: ${err2.message}`);
@@ -264,6 +337,9 @@ async function handleMessage(data) {
     }
   } finally {
     state.running = false;
+  }
+  } catch (fatalErr) {
+    console.error('[handleMessage FATAL]', fatalErr.message, fatalErr.stack);
   }
 }
 
