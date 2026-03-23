@@ -52,7 +52,6 @@ const CLAUDE_CLI = (() => {
 })();
 
 const NVM_BIN = path.dirname(NVM_NODE);
-const CLAUDE_SESSIONS_BASE = path.join(process.env.HOME, '.claude', 'projects');
 
 // ── Lark clients ─────────────────────────────────────────────────────────────
 const apiClient = new lark.Client({
@@ -102,30 +101,7 @@ function getState(openId) {
 
 loadState();
 
-// ── Session ID helpers ────────────────────────────────────────────────────────
-// Encode workdir to claude's project folder name: /Users/x.y/foo → -Users-x-y-foo
-// Claude replaces both '/' and '.' with '-'
-function encodeWorkdir(dir) {
-  return dir.replace(/[/.]/g, '-');
-}
-
-// Find session JSONL created AFTER a given timestamp (for tracking new sessions)
-// Uses birthtime (creation time) to avoid picking up existing sessions modified by other processes
-function findNewSessionId(workdir, afterMs) {
-  const projectDir = path.join(CLAUDE_SESSIONS_BASE, encodeWorkdir(workdir));
-  try {
-    const files = fs.readdirSync(projectDir)
-      .filter(f => f.endsWith('.jsonl'))
-      .map(f => {
-        const stat = fs.statSync(path.join(projectDir, f));
-        return { name: f, btime: stat.birthtimeMs, mtime: stat.mtimeMs };
-      })
-      .filter(f => f.btime >= afterMs) // only files born after we started
-      .sort((a, b) => b.btime - a.btime);
-    if (files.length > 0) return path.basename(files[0].name, '.jsonl');
-  } catch (_) {}
-  return null;
-}
+// (session ID is now parsed directly from Claude's JSON output)
 
 // ── Lark message helpers ──────────────────────────────────────────────────────
 async function reply(chatId, text) {
@@ -152,6 +128,7 @@ async function reply(chatId, text) {
 }
 
 // ── Run Claude ────────────────────────────────────────────────────────────────
+// Returns { result: string, sessionId: string|null }
 function runClaude(prompt, workdir, sessionId) {
   return new Promise((resolve, reject) => {
     if (!CLAUDE_CLI) return reject(new Error('claude cli.js not found'));
@@ -164,7 +141,8 @@ function runClaude(prompt, workdir, sessionId) {
       FORCE_COLOR: '0',
     };
 
-    const args = [CLAUDE_CLI, '-p', prompt, '--dangerously-skip-permissions', '--output-format', 'text'];
+    // Use JSON output format so we can reliably extract session_id
+    const args = [CLAUDE_CLI, '-p', prompt, '--dangerously-skip-permissions', '--output-format', 'json'];
     if (sessionId) args.push('--resume', sessionId);
 
     let stdout = '';
@@ -181,10 +159,22 @@ function runClaude(prompt, workdir, sessionId) {
 
     proc.on('close', code => {
       clearTimeout(timer);
-      const result = stdout.trim() || stderr.trim();
-      if (result) resolve(result);
-      else if (code === 0) resolve('✅ Done (no output)');
-      else reject(new Error(`Claude exited with code ${code}\n${stderr.trim()}`));
+      // Try to parse JSON output
+      try {
+        const json = JSON.parse(stdout.trim());
+        const text = (json.result || '').trim() || '✅ Done (no output)';
+        const newSessionId = json.session_id || null;
+        if (json.is_error) {
+          return reject(new Error(text));
+        }
+        return resolve({ result: text, sessionId: newSessionId });
+      } catch (_) {
+        // Fallback: not JSON (shouldn't happen), use raw output
+        const raw = stdout.trim() || stderr.trim();
+        if (raw) return resolve({ result: raw, sessionId: null });
+        if (code === 0) return resolve({ result: '✅ Done (no output)', sessionId: null });
+        reject(new Error(`Claude exited with code ${code}\n${stderr.trim()}`));
+      }
     });
 
     proc.on('error', err => { clearTimeout(timer); reject(err); });
@@ -303,16 +293,12 @@ async function handleMessage(data) {
   await reply(chatId, `🔄 Running in \`${state.workdir}\` ${sessionLabel}…`);
 
   try {
-    const startMs = Date.now();
-    const result = await runClaude(text, state.workdir, state.sessionId);
+    const { result, sessionId: newSessionId } = await runClaude(text, state.workdir, state.sessionId);
 
-    // After first run, capture session ID so next message can resume it
-    if (!state.sessionId) {
-      const newId = findNewSessionId(state.workdir, startMs);
-      if (newId) {
-        state.sessionId = newId;
-        console.log(`[${openId}] New session started: ${newId}`);
-      }
+    // Update session ID from Claude's JSON output (reliable, no file scanning needed)
+    if (newSessionId && newSessionId !== state.sessionId) {
+      console.log(`[${openId}] Session: ${state.sessionId || 'new'} → ${newSessionId}`);
+      state.sessionId = newSessionId;
     }
     saveState();
 
@@ -323,10 +309,8 @@ async function handleMessage(data) {
       console.log(`[${openId}] Session ${state.sessionId} not found, starting fresh`);
       state.sessionId = null;
       try {
-        const startMs = Date.now();
-        const result = await runClaude(text, state.workdir, null);
-        const newId = findNewSessionId(state.workdir, startMs);
-        if (newId) state.sessionId = newId;
+        const { result, sessionId: newSessionId } = await runClaude(text, state.workdir, null);
+        if (newSessionId) state.sessionId = newSessionId;
         saveState();
         await reply(chatId, result);
       } catch (err2) {
