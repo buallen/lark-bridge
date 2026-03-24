@@ -331,6 +331,7 @@ async function handleMessage(data) {
       for (const line of (lang?.content || [])) {
         for (const el of line) {
           if (el.tag === 'text' && el.text) textParts.push(el.text);
+          else if (el.tag === 'at' && el.user_name) textParts.push(`@${el.user_name}`);
           else if (el.tag === 'img' && el.image_key) {
             try {
               const imgPath = await downloadLarkImage(msgId, el.image_key);
@@ -343,7 +344,11 @@ async function handleMessage(data) {
         }
       }
       text = textParts.join('\n').trim();
-      if (!text) return;
+      if (!text) {
+        // post 内容为空（可能是纯 @mention 或系统通知），用原始 JSON 兜底
+        console.log('[msg] post content empty, raw:', msg.content?.slice(0, 300));
+        text = `[富文本消息（原始内容）]\n${msg.content?.slice(0, 1000) || ''}`;
+      }
 
     } else if (msgType === 'merge_forward') {
       // 转发的聊天记录
@@ -422,6 +427,7 @@ async function handleMessage(data) {
     }
 
     const state = getState(openId);
+    console.log('[claude] prompt preview:', text.slice(0, 120).replace(/\n/g, '↵'));
 
     // ── Built-in commands ────────────────────────────────────────────────────
     if (text === 'help') { await reply(chatId, HELP_TEXT); return; }
