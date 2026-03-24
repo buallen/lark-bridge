@@ -127,9 +127,10 @@ async function reply(chatId, text) {
   }
 }
 
-// ── Run Claude ────────────────────────────────────────────────────────────────
+// ── Run Claude (streaming) ────────────────────────────────────────────────────
+// onEvent(event) is called for each stream-json event (tool_use, text, etc.)
 // Returns { result: string, sessionId: string|null }
-function runClaude(prompt, workdir, sessionId) {
+function runClaude(prompt, workdir, sessionId, onEvent) {
   return new Promise((resolve, reject) => {
     if (!CLAUDE_CLI) return reject(new Error('claude cli.js not found'));
 
@@ -141,15 +142,36 @@ function runClaude(prompt, workdir, sessionId) {
       FORCE_COLOR: '0',
     };
 
-    // Use JSON output format so we can reliably extract session_id
-    const args = [CLAUDE_CLI, '-p', prompt, '--dangerously-skip-permissions', '--output-format', 'json'];
+    const args = [CLAUDE_CLI, '-p', prompt, '--dangerously-skip-permissions', '--output-format', 'stream-json'];
     if (sessionId) args.push('--resume', sessionId);
 
-    let stdout = '';
+    let lineBuffer = '';
     let stderr = '';
+    let finalResult = null;
+    let finalSessionId = null;
     const proc = spawn(NVM_NODE, args, { cwd: workdir, env });
 
-    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stdout.on('data', d => {
+      lineBuffer += d.toString();
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop(); // keep incomplete last line
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (onEvent) onEvent(event);
+          if (event.type === 'result') {
+            finalResult = (event.result || '').trim();
+            finalSessionId = event.session_id || null;
+            if (event.is_error) {
+              proc.kill('SIGTERM');
+              reject(new Error(finalResult || 'Claude returned an error'));
+            }
+          }
+        } catch (_) {}
+      }
+    });
+
     proc.stderr.on('data', d => { stderr += d.toString(); });
 
     const timer = setTimeout(() => {
@@ -159,22 +181,14 @@ function runClaude(prompt, workdir, sessionId) {
 
     proc.on('close', code => {
       clearTimeout(timer);
-      // Try to parse JSON output
-      try {
-        const json = JSON.parse(stdout.trim());
-        const text = (json.result || '').trim() || '✅ Done (no output)';
-        const newSessionId = json.session_id || null;
-        if (json.is_error) {
-          return reject(new Error(text));
-        }
-        return resolve({ result: text, sessionId: newSessionId });
-      } catch (_) {
-        // Fallback: not JSON (shouldn't happen), use raw output
-        const raw = stdout.trim() || stderr.trim();
-        if (raw) return resolve({ result: raw, sessionId: null });
-        if (code === 0) return resolve({ result: '✅ Done (no output)', sessionId: null });
-        reject(new Error(`Claude exited with code ${code}\n${stderr.trim()}`));
+      if (finalResult !== null) {
+        return resolve({ result: finalResult || '✅ Done (no output)', sessionId: finalSessionId });
       }
+      // Fallback if no result event received
+      const raw = lineBuffer.trim() || stderr.trim();
+      if (raw) return resolve({ result: raw, sessionId: null });
+      if (code === 0) return resolve({ result: '✅ Done (no output)', sessionId: null });
+      reject(new Error(`Claude exited with code ${code}\n${stderr.trim()}`));
     });
 
     proc.on('error', err => { clearTimeout(timer); reject(err); });
@@ -292,23 +306,27 @@ async function handleMessage(data) {
   const sessionLabel = state.sessionId ? '(continuing session)' : '(new session)';
   await reply(chatId, `🔄 Running in \`${state.workdir}\` ${sessionLabel}…`);
 
-  // Heartbeat: every 3 min notify user that the task is still running
-  const startTime = Date.now();
-  const heartbeat = setInterval(async () => {
-    const mins = Math.round((Date.now() - startTime) / 60000);
-    await reply(chatId, `⏳ Still working… (${mins} min elapsed)`);
-  }, 3 * 60 * 1000);
+  // Stream events: notify user on each tool call so they see progress in real time
+  const onEvent = (event) => {
+    if (event.type === 'assistant' && Array.isArray(event.message?.content)) {
+      for (const block of event.message.content) {
+        if (block.type === 'tool_use') {
+          reply(chatId, `🔧 \`${block.name}\``).catch(() => {});
+        }
+      }
+    }
+  };
+
+  const runOnce = (sid) => runClaude(text, state.workdir, sid, onEvent);
 
   try {
-    const { result, sessionId: newSessionId } = await runClaude(text, state.workdir, state.sessionId);
+    const { result, sessionId: newSessionId } = await runOnce(state.sessionId);
 
-    // Update session ID from Claude's JSON output (reliable, no file scanning needed)
     if (newSessionId && newSessionId !== state.sessionId) {
       console.log(`[${openId}] Session: ${state.sessionId || 'new'} → ${newSessionId}`);
       state.sessionId = newSessionId;
     }
     saveState();
-
     await reply(chatId, result);
   } catch (err) {
     // If resume failed (session expired etc), retry as fresh session
@@ -316,7 +334,7 @@ async function handleMessage(data) {
       console.log(`[${openId}] Session ${state.sessionId} not found, starting fresh`);
       state.sessionId = null;
       try {
-        const { result, sessionId: newSessionId } = await runClaude(text, state.workdir, null);
+        const { result, sessionId: newSessionId } = await runOnce(null);
         if (newSessionId) state.sessionId = newSessionId;
         saveState();
         await reply(chatId, result);
@@ -327,7 +345,6 @@ async function handleMessage(data) {
       await reply(chatId, `❌ Error: ${err.message}`);
     }
   } finally {
-    clearInterval(heartbeat);
     state.running = false;
   }
   } catch (fatalErr) {
