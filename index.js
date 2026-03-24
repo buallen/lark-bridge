@@ -163,6 +163,40 @@ function encodeWorkdir(dir) {
   return dir.replace(/[/.]/g, '-');
 }
 
+// 列出某个 workdir 下所有会话，按修改时间倒序
+function listSessions(workdir) {
+  const projectDir = path.join(CLAUDE_SESSIONS_BASE, encodeWorkdir(workdir));
+  try {
+    const files = fs.readdirSync(projectDir)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => {
+        const fullPath = path.join(projectDir, f);
+        const stat = fs.statSync(fullPath);
+        const sessionId = path.basename(f, '.jsonl');
+        // 读前几行，提取 summary 或第一条 user 消息
+        let label = '';
+        try {
+          const lines = fs.readFileSync(fullPath, 'utf8').split('\n').filter(l => l.trim());
+          for (const line of lines.slice(0, 20)) {
+            try {
+              const ev = JSON.parse(line);
+              if (ev.type === 'summary' && ev.summary) { label = ev.summary; break; }
+              if (ev.type === 'user' && ev.message?.content) {
+                const c = ev.message.content;
+                label = typeof c === 'string' ? c : (c[0]?.text || '');
+                break;
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
+        label = label.replace(/\n/g, ' ').slice(0, 60) || sessionId.slice(0, 8) + '…';
+        return { sessionId, mtime: stat.mtimeMs, label };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    return files;
+  } catch (_) { return []; }
+}
+
 // 找出某次 Claude 运行后新建的 session 文件（用 birthtime 判断）
 function findNewSessionId(workdir, afterMs) {
   const projectDir = path.join(CLAUDE_SESSIONS_BASE, encodeWorkdir(workdir));
@@ -227,18 +261,47 @@ function runClaude(prompt, workdir, sessionId, onProgress = null) {
       FORCE_COLOR: '0',
     };
 
-    const args = [CLAUDE_CLI, '-p', prompt, '--dangerously-skip-permissions', '--output-format', 'text'];
+    // 用 stream-json 格式获取真正的流式输出（工具调用事件 + 文本 chunk）
+    const args = [CLAUDE_CLI, '-p', prompt, '--dangerously-skip-permissions', '--output-format', 'stream-json', '--verbose'];
     if (sessionId) args.push('--resume', sessionId);
 
-    let stdout = '';
+    let finalText = '';   // 最终 assistant 文本
+    let streamText = '';  // 流式累积（用于进度预览）
+    let toolActivity = '';// 最近的工具活动描述
     let stderr = '';
-    // stdio: ['ignore', 'pipe', 'pipe'] — 将 stdin 重定向到 /dev/null，避免 3 秒等待
+    let buf = '';         // 行缓冲，处理跨 chunk 的 JSON 行
+
     const proc = spawn(NVM_NODE, args, { cwd: workdir, env, stdio: ['ignore', 'pipe', 'pipe'] });
 
     proc.stdout.on('data', d => {
-      const chunk = d.toString();
-      stdout += chunk;
-      if (onProgress) onProgress(stdout); // 传入完整已输出文本
+      buf += d.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop(); // 最后一段可能不完整，留到下次
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const ev = JSON.parse(trimmed);
+          // 提取流式文本 chunk（assistant message 的文本内容）
+          if (ev.type === 'assistant' && ev.message?.content) {
+            for (const block of ev.message.content) {
+              if (block.type === 'text') {
+                streamText += block.text;
+                if (onProgress) onProgress(streamText, toolActivity);
+              } else if (block.type === 'tool_use') {
+                toolActivity = `🔧 ${block.name}`;
+                if (onProgress) onProgress(streamText, toolActivity);
+              }
+            }
+          }
+          // result 事件包含最终文本
+          if (ev.type === 'result' && ev.result) {
+            finalText = ev.result;
+          }
+        } catch (_) {
+          // 非 JSON 行忽略
+        }
+      }
     });
     proc.stderr.on('data', d => { stderr += d.toString(); });
 
@@ -250,10 +313,10 @@ function runClaude(prompt, workdir, sessionId, onProgress = null) {
     proc.on('close', code => {
       clearTimeout(timer);
       if (code === 0) {
-        resolve(stdout.trim() || '✅ Done (no output)');
+        // 优先用 result 字段，fallback 用流式累积的文本
+        resolve(finalText.trim() || streamText.trim() || '✅ Done (no output)');
       } else {
-        // 非 0 退出码一律 reject，触发上层错误处理（如 session 过期重试）
-        reject(new Error(stderr.trim() || stdout.trim() || `Claude exited with code ${code}`));
+        reject(new Error(stderr.trim() || streamText.trim() || `Claude exited with code ${code}`));
       }
     });
 
@@ -302,24 +365,19 @@ async function deleteMsg(messageId) {
 const HELP_TEXT = `🤖 Claude Code Bot
 
 📋 Commands:
-  help        — show this help
-  pwd         — show current directory & session ID
-  cd <path>   — change working directory (resets context)
-  new         — clear context, start a fresh conversation
+  help          — 显示帮助
+  pwd           — 显示当前目录和会话 ID
+  cd <path>     — 切换工作目录（重置上下文）
+  new           — 清除上下文，开始新会话
+  sessions      — 列出当前目录的历史会话
+  use <n>       — 切换到第 n 个历史会话
 
-💬 Conversation:
-  Any other message → sent to Claude Code as a task
-  Context is preserved across messages within a session
-  Send "new" to start over with a clean slate
+💬 对话:
+  其他消息 → 直接发送给 Claude Code
+  同一会话内保留上下文
+  发送 "new" 重新开始
 
-📁 Default directory: ${DEFAULT_WORKDIR}
-
-💡 Examples:
-  list all subfolders here
-  cd my-project
-  analyze security issues in this codebase
-  new
-  what files did you just change?`;
+📁 默认目录: ${DEFAULT_WORKDIR}`;
 
 async function handleMessage(data) {
   try {
@@ -527,7 +585,45 @@ console.log(hello);
     if (text === 'new') {
       state.sessionId = null;
       saveState();
-      await reply(chatId, '🆕 Started a new conversation. Context has been cleared.');
+      await reply(chatId, '🆕 已开始新会话，上下文已清除。');
+      return;
+    }
+
+    if (text === 'sessions' || /^sessions \d+$/.test(text)) {
+      const PAGE_SIZE = 10;
+      const page = text === 'sessions' ? 1 : parseInt(text.split(' ')[1], 10);
+      const sessions = listSessions(state.workdir);
+      if (sessions.length === 0) {
+        await reply(chatId, `📭 当前目录 \`${state.workdir}\` 没有历史会话。`);
+        return;
+      }
+      const totalPages = Math.ceil(sessions.length / PAGE_SIZE);
+      const p = Math.max(1, Math.min(page, totalPages));
+      const slice = sessions.slice((p - 1) * PAGE_SIZE, p * PAGE_SIZE);
+      const lines = slice.map((s, i) => {
+        const idx = (p - 1) * PAGE_SIZE + i + 1;
+        const date = new Date(s.mtime).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+        const active = s.sessionId === state.sessionId ? ' ◀ 当前' : '';
+        return `**${idx}.** ${s.label}\n   *${date}*${active}`;
+      });
+      let header = `📋 **历史会话** (共 ${sessions.length} 个，第 ${p}/${totalPages} 页)\n`;
+      if (totalPages > 1) header += `发 \`sessions ${p + 1 <= totalPages ? p + 1 : 1}\` 翻页，发 \`use <序号>\` 切换\n`;
+      else header += `发 \`use <序号>\` 切换\n`;
+      await reply(chatId, header + '\n' + lines.join('\n\n'));
+      return;
+    }
+
+    if (text.startsWith('use ')) {
+      const n = parseInt(text.slice(4).trim(), 10);
+      const sessions = listSessions(state.workdir);
+      if (isNaN(n) || n < 1 || n > sessions.length) {
+        await reply(chatId, `❌ 请输入有效序号 1–${sessions.length}，先发 \`sessions\` 查看列表。`);
+        return;
+      }
+      const target = sessions[n - 1];
+      state.sessionId = target.sessionId;
+      saveState();
+      await reply(chatId, `✅ 已切换到会话 **${n}**: ${target.label}`);
       return;
     }
 
@@ -562,32 +658,58 @@ console.log(hello);
 - 不要输出过长的纯文字段落，适当分段
 以下是用户的请求：]\n`;
 
-    // 流式模拟：每 4s 发一条新进度消息（新消息会推送到客户端），完成后删除所有进度消息
+    // 流式模拟：用 setInterval 每 4s 强制发一条新进度消息（不依赖 Claude stdout 缓冲）
     const progressMsgIds = [];
     const startMs = Date.now();
-    let lastProgressTime = 0;
-    let lastProgressLen = 0;
+    let latestOutput = ''; // 由 onProgress 回调更新
+    let progressInterval = null;
+    let lastSentLen = -1; // 上次发送时的输出长度，避免重复内容
 
-    const onProgress = (fullText) => {
-      const now = Date.now();
-      if (now - lastProgressTime < 4000) return;
-      if (fullText.length === lastProgressLen) return; // 没有新内容
-      lastProgressTime = now;
-      lastProgressLen = fullText.length;
-      const elapsed = Math.round((now - startMs) / 1000);
-      const preview = fullText.length > 800 ? '…' + fullText.slice(-800) : fullText;
-      sendTextMsg(chatId, `⏳ 生成中 (${elapsed}s)…\n\n${preview} ▌`).then(id => {
+    const sendProgressUpdate = () => {
+      const elapsed = Math.round((Date.now() - startMs) / 1000);
+      console.log(`[progress] tick elapsed=${elapsed}s output=${latestOutput.length} lastSent=${lastSentLen} tool=${latestTool}`);
+      // 只有内容有变化、或是定时刷新时间戳（每 8s）才发新消息
+      if (latestOutput.length === lastSentLen && !latestTool && elapsed % 8 !== 0 && elapsed > 0) {
+        console.log('[progress] skip (no change)');
+        return;
+      }
+      lastSentLen = latestOutput.length;
+      const preview = latestOutput.length > 600 ? '…' + latestOutput.slice(-600) : latestOutput;
+      let msg = `⏳ 生成中 (${elapsed}s)…`;
+      if (latestTool) { msg += `\n${latestTool}`; latestTool = ''; }
+      if (preview) msg += `\n\n${preview} ▌`;
+      console.log('[progress] sending msg len:', msg.length);
+      sendTextMsg(chatId, msg).then(id => {
+        console.log('[progress] sent id:', id);
         if (id) progressMsgIds.push(id);
-      }).catch(() => {});
+        // 只保留最新 1 条进度消息，删除旧的
+        if (progressMsgIds.length > 1) {
+          const toDelete = progressMsgIds.splice(0, progressMsgIds.length - 1);
+          toDelete.forEach(mid => deleteMsg(mid));
+        }
+      }).catch(e => console.error('[progress] sendTextMsg error:', e.message));
+    };
+
+    let latestTool = '';
+    const onProgress = (fullText, toolActivity) => {
+      latestOutput = fullText;
+      if (toolActivity) latestTool = toolActivity;
     };
 
     const runWithStreaming = async (prompt, sessionId) => {
-      const result = await runClaude(prompt, state.workdir, sessionId, onProgress);
-      if (!state.sessionId) {
-        const newId = findNewSessionId(state.workdir, startMs);
-        if (newId) { state.sessionId = newId; console.log(`[${openId}] New session: ${newId}`); }
+      // 启动定时器
+      progressInterval = setInterval(sendProgressUpdate, 4000);
+      try {
+        const result = await runClaude(prompt, state.workdir, sessionId, onProgress);
+        if (!state.sessionId) {
+          const newId = findNewSessionId(state.workdir, startMs);
+          if (newId) { state.sessionId = newId; console.log(`[${openId}] New session: ${newId}`); }
+        }
+        return result;
+      } finally {
+        clearInterval(progressInterval);
+        progressInterval = null;
       }
-      return result;
     };
 
     // 发起始占位（让用户知道开始运行了）
@@ -595,6 +717,7 @@ console.log(hello);
     if (placeholderMsgId) progressMsgIds.push(placeholderMsgId);
 
     const cleanup = async () => {
+      if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
       for (const id of progressMsgIds) await deleteMsg(id);
     };
 
