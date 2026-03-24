@@ -279,36 +279,23 @@ function makeCardContent(markdownText) {
   return JSON.stringify({ config: { wide_screen_mode: true }, elements });
 }
 
-// patch 已有的 interactive card（流式更新 + 最终结果复用同一条消息）
-async function patchCard(messageId, markdownText) {
-  try {
-    const res = await apiClient.im.message.patch({
-      path: { message_id: messageId },
-      data: { content: makeCardContent(markdownText) },
-    });
-    if (res.code !== 0) console.error('[patch error]', res.code, res.msg);
-    else console.log('[patch ok] msgId:', messageId, 'len:', markdownText.length);
-  } catch (e) {
-    console.error('[patch exception]', e.message, e.response?.data ? JSON.stringify(e.response.data).slice(0, 200) : '');
-  }
-}
-
-// 发送 interactive card 占位消息，返回 message_id
-async function sendCardPlaceholder(chatId, text) {
+// 发送普通文本消息，返回 message_id
+async function sendTextMsg(chatId, text) {
   try {
     const res = await apiClient.im.message.create({
       params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        content: makeCardContent(text),
-        msg_type: 'interactive',
-      },
+      data: { receive_id: chatId, content: JSON.stringify({ text }), msg_type: 'text' },
     });
     return res.data?.message_id || null;
   } catch (e) {
-    console.error('[placeholder exception]', e.message);
+    console.error('[sendText exception]', e.message);
     return null;
   }
+}
+
+// 删除消息
+async function deleteMsg(messageId) {
+  try { await apiClient.im.message.delete({ path: { message_id: messageId } }); } catch (_) {}
 }
 
 // ── Message handler ───────────────────────────────────────────────────────────
@@ -575,19 +562,26 @@ console.log(hello);
 - 不要输出过长的纯文字段落，适当分段
 以下是用户的请求：]\n`;
 
-    // 流式显示：发 interactive card 占位，每 2s patch 更新，完成后 patch 成最终内容
-    const streamMsgId = await sendCardPlaceholder(chatId, '⏳ 生成中...');
-    let lastPatch = 0;
+    // 流式模拟：每 4s 发一条新进度消息（新消息会推送到客户端），完成后删除所有进度消息
+    const progressMsgIds = [];
+    const startMs = Date.now();
+    let lastProgressTime = 0;
+    let lastProgressLen = 0;
+
     const onProgress = (fullText) => {
       const now = Date.now();
-      if (!streamMsgId || now - lastPatch < 2000) return;
-      lastPatch = now;
-      const preview = fullText.length > 1500 ? '…' + fullText.slice(-1500) : fullText;
-      patchCard(streamMsgId, preview + ' ▌').catch(() => {});
+      if (now - lastProgressTime < 4000) return;
+      if (fullText.length === lastProgressLen) return; // 没有新内容
+      lastProgressTime = now;
+      lastProgressLen = fullText.length;
+      const elapsed = Math.round((now - startMs) / 1000);
+      const preview = fullText.length > 800 ? '…' + fullText.slice(-800) : fullText;
+      sendTextMsg(chatId, `⏳ 生成中 (${elapsed}s)…\n\n${preview} ▌`).then(id => {
+        if (id) progressMsgIds.push(id);
+      }).catch(() => {});
     };
 
     const runWithStreaming = async (prompt, sessionId) => {
-      const startMs = Date.now();
       const result = await runClaude(prompt, state.workdir, sessionId, onProgress);
       if (!state.sessionId) {
         const newId = findNewSessionId(state.workdir, startMs);
@@ -596,12 +590,19 @@ console.log(hello);
       return result;
     };
 
+    // 发起始占位（让用户知道开始运行了）
+    const placeholderMsgId = await sendTextMsg(chatId, `⏳ 生成中…`);
+    if (placeholderMsgId) progressMsgIds.push(placeholderMsgId);
+
+    const cleanup = async () => {
+      for (const id of progressMsgIds) await deleteMsg(id);
+    };
+
     try {
       const result = await runWithStreaming(LARK_FORMAT_HINT + text, state.sessionId);
       saveState();
-      // 直接 patch 成最终格式化内容（复用同一条消息，无需删除）
-      if (streamMsgId) await patchCard(streamMsgId, result);
-      else await reply(chatId, result);
+      await cleanup();
+      await reply(chatId, result);
     } catch (err) {
       if (state.sessionId && err.message.includes('No conversation found')) {
         console.log(`[${openId}] Session expired, retrying fresh`);
@@ -609,15 +610,15 @@ console.log(hello);
         try {
           const result = await runWithStreaming(LARK_FORMAT_HINT + text, null);
           saveState();
-          if (streamMsgId) await patchCard(streamMsgId, result);
-          else await reply(chatId, result);
+          await cleanup();
+          await reply(chatId, result);
         } catch (err2) {
-          if (streamMsgId) await patchCard(streamMsgId, `❌ Error: ${err2.message}`);
-          else await reply(chatId, `❌ Error: ${err2.message}`);
+          await cleanup();
+          await reply(chatId, `❌ Error: ${err2.message}`);
         }
       } else {
-        if (streamMsgId) await patchCard(streamMsgId, `❌ Error: ${err.message}`);
-        else await reply(chatId, `❌ Error: ${err.message}`);
+        await cleanup();
+        await reply(chatId, `❌ Error: ${err.message}`);
       }
     } finally {
       state.running = false;
