@@ -193,10 +193,14 @@ function buildCardElements(markdown) {
   for (const part of parts) {
     const cbMatch = part.match(/^```([^\n]*)\n([\s\S]*?)```$/);
     if (cbMatch) {
-      // code_block 在 Lark card 中不被支持，改用 plain_text div 显示
-      const lang = cbMatch[1].trim();
-      const header = lang ? `[ ${lang} ]` : '[ code ]';
-      elements.push({ tag: 'div', text: { content: `${header}\n${cbMatch[2]}`, tag: 'plain_text' } });
+      // code_block 元素（card v2 支持）
+      const lang = cbMatch[1].trim() || 'Plain Text';
+      // Lark 要求语言名首字母大写
+      const langMap = { javascript: 'JavaScript', typescript: 'TypeScript', python: 'Python',
+        bash: 'Bash', shell: 'Shell', go: 'Go', java: 'Java', rust: 'Rust', cpp: 'C++',
+        c: 'C', css: 'CSS', html: 'HTML', json: 'JSON', yaml: 'YAML', sql: 'SQL', xml: 'XML' };
+      const normalizedLang = langMap[lang.toLowerCase()] || lang;
+      elements.push({ tag: 'code_block', language: normalizedLang, text: cbMatch[2].replace(/\n$/, '') });
       continue;
     }
 
@@ -241,11 +245,12 @@ function buildCardElements(markdown) {
   return elements.length > 0 ? elements : [{ tag: 'div', text: { content: markdown, tag: 'lark_md' } }];
 }
 
-// 使用 interactive card 发送，代码块用 code_block 元素，其余用 lark_md
+// 使用 interactive card v2 发送，代码块用 code_block 元素，其余用 lark_md
 async function reply(chatId, markdown) {
   const card = {
+    schema: '2.0',
     config: { wide_screen_mode: true },
-    elements: buildCardElements(markdown),
+    body: { elements: buildCardElements(markdown) },
   };
 
   try {
