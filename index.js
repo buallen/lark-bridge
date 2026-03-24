@@ -180,123 +180,40 @@ function findNewSessionId(workdir, afterMs) {
   return null;
 }
 
-// ── Markdown → Lark post converter ───────────────────────────────────────────
-// 解析行内 markdown（**bold**, *italic*, `code`, [text](url)）为 Lark inline 元素
-function parseInline(text, extraStyle = {}) {
-  const elements = [];
-  const pattern = /(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^\)]+)\))/gs;
-  let last = 0;
-  let m;
-  while ((m = pattern.exec(text)) !== null) {
-    if (m.index > last) {
-      elements.push({ tag: 'text', text: text.slice(last, m.index), ...extraStyle });
-    }
-    if (m[2] !== undefined) {
-      elements.push({ tag: 'text', text: m[2], bold: true });
-    } else if (m[3] !== undefined) {
-      elements.push({ tag: 'text', text: m[3], italic: true });
-    } else if (m[4] !== undefined) {
-      // inline code → bold
-      elements.push({ tag: 'text', text: m[4], bold: true });
-    } else if (m[5] !== undefined) {
-      elements.push({ tag: 'a', text: m[5], href: m[6] });
-    }
-    last = m.index + m[0].length;
-  }
-  if (last < text.length) elements.push({ tag: 'text', text: text.slice(last), ...extraStyle });
-  if (elements.length === 0) elements.push({ tag: 'text', text, ...extraStyle });
-  return elements;
-}
-
-// 将 markdown 字符串转成 Lark post content（二维数组）
-function markdownToLarkPost(md) {
-  const lines = md.split('\n');
-  const content = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-
-    // 代码块 ```lang ... ```
-    if (line.startsWith('```')) {
-      const lang = line.slice(3).trim() || 'plain_text';
-      const codeLines = [];
-      i++;
-      while (i < lines.length && !lines[i].startsWith('```')) {
-        codeLines.push(lines[i]);
-        i++;
-      }
-      i++; // skip closing ```
-      content.push([{ tag: 'code_block', language: lang, text: codeLines.join('\n') }]);
-      continue;
-    }
-
-    // 标题 # / ## / ###
-    const hMatch = line.match(/^(#{1,3})\s+(.+)/);
-    if (hMatch) {
-      content.push(parseInline(hMatch[2], { bold: true }));
-      i++; continue;
-    }
-
-    // 分割线
-    if (/^[-*_]{3,}\s*$/.test(line)) {
-      content.push([{ tag: 'text', text: '─────────────────────' }]);
-      i++; continue;
-    }
-
-    // 无序列表
-    const ulMatch = line.match(/^(\s*)[-*+]\s+(.+)/);
-    if (ulMatch) {
-      const indent = ulMatch[1].length > 0 ? '  ' : '';
-      content.push(parseInline(indent + '• ' + ulMatch[2]));
-      i++; continue;
-    }
-
-    // 有序列表
-    const olMatch = line.match(/^(\s*)(\d+)\.\s+(.+)/);
-    if (olMatch) {
-      content.push(parseInline(olMatch[2] + '. ' + olMatch[3]));
-      i++; continue;
-    }
-
-    // 引用块 >
-    const bqMatch = line.match(/^>\s*(.*)/);
-    if (bqMatch) {
-      content.push(parseInline('┃ ' + bqMatch[1], { italic: true }));
-      i++; continue;
-    }
-
-    // 空行
-    if (line.trim() === '') {
-      content.push([{ tag: 'text', text: ' ' }]);
-      i++; continue;
-    }
-
-    // 普通行（含行内格式）
-    content.push(parseInline(line));
-    i++;
-  }
-  return content;
-}
-
 // ── Lark message helpers ──────────────────────────────────────────────────────
+// 使用 interactive card + lark_md，Lark 原生渲染 markdown（支持加粗/斜体/代码块/列表等）
 async function reply(chatId, markdown) {
-  const content = markdownToLarkPost(markdown);
-  // 每次最多发 60 行，避免超过 Lark 消息大小限制
-  const CHUNK = 60;
-  for (let i = 0; i < content.length; i += CHUNK) {
-    try {
-      const res = await apiClient.im.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: chatId,
-          content: JSON.stringify({ zh_cn: { title: '', content: content.slice(i, i + CHUNK) } }),
-          msg_type: 'post',
-        },
-      });
-      if (res.code !== 0) console.error('[reply error] code:', res.code, 'msg:', res.msg);
-    } catch (e) {
-      console.error('[reply exception]', e.message);
+  // 按行分组，每组不超过 3000 字符，避免超出单个 card element 限制
+  const lines = markdown.split('\n');
+  const groups = [];
+  let cur = [], curLen = 0;
+  for (const line of lines) {
+    if (curLen + line.length + 1 > 3000 && cur.length > 0) {
+      groups.push(cur.join('\n'));
+      cur = []; curLen = 0;
     }
+    cur.push(line);
+    curLen += line.length + 1;
+  }
+  if (cur.length > 0) groups.push(cur.join('\n'));
+
+  const card = {
+    config: { wide_screen_mode: true },
+    elements: groups.map(g => ({ tag: 'div', text: { content: g, tag: 'lark_md' } })),
+  };
+
+  try {
+    const res = await apiClient.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        content: JSON.stringify(card),
+        msg_type: 'interactive',
+      },
+    });
+    if (res.code !== 0) console.error('[reply error] code:', res.code, 'msg:', res.msg);
+  } catch (e) {
+    console.error('[reply exception]', e.message);
   }
 }
 
