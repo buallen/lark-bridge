@@ -193,9 +193,10 @@ function buildCardElements(markdown) {
   for (const part of parts) {
     const cbMatch = part.match(/^```([^\n]*)\n([\s\S]*?)```$/);
     if (cbMatch) {
-      // 代码块 → code_block element
-      const lang = cbMatch[1].trim() || 'plain_text';
-      elements.push({ tag: 'code_block', language: lang, text: cbMatch[2] });
+      // code_block 在 Lark card 中不被支持，改用 plain_text div 显示
+      const lang = cbMatch[1].trim();
+      const header = lang ? `[ ${lang} ]` : '[ code ]';
+      elements.push({ tag: 'div', text: { content: `${header}\n${cbMatch[2]}`, tag: 'plain_text' } });
       continue;
     }
 
