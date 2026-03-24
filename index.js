@@ -235,7 +235,7 @@ async function reply(chatId, markdown) {
 }
 
 // ── Run Claude CLI ────────────────────────────────────────────────────────────
-function runClaude(prompt, workdir, sessionId) {
+function runClaude(prompt, workdir, sessionId, onProgress = null) {
   return new Promise((resolve, reject) => {
     if (!CLAUDE_CLI) return reject(new Error('claude cli.js not found'));
 
@@ -255,7 +255,11 @@ function runClaude(prompt, workdir, sessionId) {
     // stdio: ['ignore', 'pipe', 'pipe'] — 将 stdin 重定向到 /dev/null，避免 3 秒等待
     const proc = spawn(NVM_NODE, args, { cwd: workdir, env, stdio: ['ignore', 'pipe', 'pipe'] });
 
-    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stdout.on('data', d => {
+      const chunk = d.toString();
+      stdout += chunk;
+      if (onProgress) onProgress(stdout); // 传入完整已输出文本
+    });
     proc.stderr.on('data', d => { stderr += d.toString(); });
 
     const timer = setTimeout(() => {
@@ -275,6 +279,46 @@ function runClaude(prompt, workdir, sessionId) {
 
     proc.on('error', err => { clearTimeout(timer); reject(err); });
   });
+}
+
+// 更新已发出的 Lark text 消息内容（用于流式显示）
+async function patchTextMessage(messageId, text) {
+  try {
+    const res = await apiClient.im.message.patch({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify({ text }) },
+    });
+    if (res.code !== 0) console.error('[patch error]', res.code, res.msg);
+  } catch (e) {
+    console.error('[patch exception]', e.message);
+  }
+}
+
+// 删除消息（用于删除流式占位消息）
+async function deleteLarkMessage(messageId) {
+  try {
+    await apiClient.im.message.delete({ path: { message_id: messageId } });
+  } catch (e) {
+    console.error('[delete exception]', e.message);
+  }
+}
+
+// 发送文字占位消息并返回 message_id（用于流式更新）
+async function sendStreamingPlaceholder(chatId, text) {
+  try {
+    const res = await apiClient.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: chatId,
+        content: JSON.stringify({ text }),
+        msg_type: 'text',
+      },
+    });
+    return res.data?.message_id || null;
+  } catch (e) {
+    console.error('[placeholder exception]', e.message);
+    return null;
+  }
 }
 
 // ── Message handler ───────────────────────────────────────────────────────────
@@ -532,8 +576,6 @@ console.log(hello);
 
     // ── Forward to Claude ────────────────────────────────────────────────────
     state.running = true;
-    const sessionLabel = state.sessionId ? '(continuing session)' : '(new session)';
-    await reply(chatId, `🔄 Running in \`${state.workdir}\` ${sessionLabel}…`);
 
     // 在用户 prompt 前注入格式说明，使输出适配 Lark 消息渲染
     const LARK_FORMAT_HINT = `[系统提示：你的回复将展示在 Lark 消息中，请遵守以下格式规则：
@@ -543,19 +585,33 @@ console.log(hello);
 - 不要输出过长的纯文字段落，适当分段
 以下是用户的请求：]\n`;
 
-    try {
-      const startMs = Date.now();
-      const result = await runClaude(LARK_FORMAT_HINT + text, state.workdir, state.sessionId);
+    // 流式显示：发占位消息，每 2s 更新一次
+    const streamMsgId = await sendStreamingPlaceholder(chatId, '⏳ 生成中...');
+    let lastPatch = 0;
+    const onProgress = (fullText) => {
+      const now = Date.now();
+      if (!streamMsgId || now - lastPatch < 2000) return;
+      lastPatch = now;
+      // 只显示末尾 1500 字符，避免超长
+      const preview = fullText.length > 1500 ? '…' + fullText.slice(-1500) : fullText;
+      patchTextMessage(streamMsgId, preview + ' ▌').catch(() => {});
+    };
 
-      // 首次运行后找到新建的 session 文件
+    const runWithStreaming = async (prompt, sessionId) => {
+      const startMs = Date.now();
+      const result = await runClaude(prompt, state.workdir, sessionId, onProgress);
       if (!state.sessionId) {
         const newId = findNewSessionId(state.workdir, startMs);
-        if (newId) {
-          state.sessionId = newId;
-          console.log(`[${openId}] New session started: ${newId}`);
-        }
+        if (newId) { state.sessionId = newId; console.log(`[${openId}] New session: ${newId}`); }
       }
+      return result;
+    };
+
+    try {
+      const result = await runWithStreaming(LARK_FORMAT_HINT + text, state.sessionId);
       saveState();
+      // 删掉流式占位，发最终格式化 card
+      if (streamMsgId) await deleteLarkMessage(streamMsgId);
       await reply(chatId, result);
     } catch (err) {
       // session 过期则重试
@@ -563,16 +619,16 @@ console.log(hello);
         console.log(`[${openId}] Session expired, retrying fresh`);
         state.sessionId = null;
         try {
-          const startMs = Date.now();
-          const result = await runClaude(text, state.workdir, null);
-          const newId = findNewSessionId(state.workdir, startMs);
-          if (newId) state.sessionId = newId;
+          const result = await runWithStreaming(LARK_FORMAT_HINT + text, null);
           saveState();
+          if (streamMsgId) await deleteLarkMessage(streamMsgId);
           await reply(chatId, result);
         } catch (err2) {
+          if (streamMsgId) await deleteLarkMessage(streamMsgId);
           await reply(chatId, `❌ Error: ${err2.message}`);
         }
       } else {
+        if (streamMsgId) await deleteLarkMessage(streamMsgId);
         await reply(chatId, `❌ Error: ${err.message}`);
       }
     } finally {
