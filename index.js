@@ -181,35 +181,70 @@ function findNewSessionId(workdir, afterMs) {
 }
 
 // ── Lark message helpers ──────────────────────────────────────────────────────
-// lark_md 不支持 > 引用块，预处理转成可视化的竖线前缀
-function preprocessMarkdown(md) {
-  return md.split('\n').map(line => {
-    const m = line.match(/^(>+)\s*(.*)/);
-    if (!m) return line;
-    return '**│** ' + m[2]; // 引用 → 加粗竖线 + 内容
-  }).join('\n');
+// lark_md 实际只支持：加粗/斜体/删除线/链接/有序列表
+// 不支持：标题/无序列表/代码块/引用/表格/分割线 → 需预处理
+
+// 将 markdown 转成 Lark card elements 数组（代码块单独用 code_block 元素）
+function buildCardElements(markdown) {
+  const elements = [];
+  // 先按代码块切割
+  const parts = markdown.split(/(```[^\n]*\n[\s\S]*?```)/g);
+
+  for (const part of parts) {
+    const cbMatch = part.match(/^```([^\n]*)\n([\s\S]*?)```$/);
+    if (cbMatch) {
+      // 代码块 → code_block element
+      const lang = cbMatch[1].trim() || 'plain_text';
+      elements.push({ tag: 'code_block', language: lang, text: cbMatch[2] });
+      continue;
+    }
+
+    if (!part.trim()) continue;
+
+    // 普通文本：逐行预处理
+    const processed = part.split('\n').map(line => {
+      // 标题 → 加粗（lark_md 不支持 #）
+      const hm = line.match(/^#{1,3}\s+(.+)/);
+      if (hm) return `**${hm[1]}**`;
+
+      // 无序列表 → • 前缀（lark_md 不渲染 -）
+      const ulm = line.match(/^(\s*)[-*+]\s+(.+)/);
+      if (ulm) return ulm[1] + '• ' + ulm[2];
+
+      // 引用块 → │ 前缀
+      const bqm = line.match(/^>+\s*(.*)/);
+      if (bqm) return `**│** ${bqm[1]}`;
+
+      // 分割线 → unicode 线
+      if (/^[-*_]{3,}\s*$/.test(line)) return '────────────────────';
+
+      return line;
+    }).join('\n');
+
+    // 按 3000 字符分组，避免超出 lark_md 单元素限制
+    const lines = processed.split('\n');
+    let cur = [], curLen = 0;
+    for (const line of lines) {
+      if (curLen + line.length + 1 > 3000 && cur.length > 0) {
+        elements.push({ tag: 'div', text: { content: cur.join('\n'), tag: 'lark_md' } });
+        cur = []; curLen = 0;
+      }
+      cur.push(line);
+      curLen += line.length + 1;
+    }
+    if (cur.length > 0) {
+      elements.push({ tag: 'div', text: { content: cur.join('\n'), tag: 'lark_md' } });
+    }
+  }
+
+  return elements.length > 0 ? elements : [{ tag: 'div', text: { content: markdown, tag: 'lark_md' } }];
 }
 
-// 使用 interactive card + lark_md，Lark 原生渲染 markdown（支持加粗/斜体/代码块/列表等）
+// 使用 interactive card 发送，代码块用 code_block 元素，其余用 lark_md
 async function reply(chatId, markdown) {
-  const processed = preprocessMarkdown(markdown);
-  // 按行分组，每组不超过 3000 字符，避免超出单个 card element 限制
-  const lines = processed.split('\n');
-  const groups = [];
-  let cur = [], curLen = 0;
-  for (const line of lines) {
-    if (curLen + line.length + 1 > 3000 && cur.length > 0) {
-      groups.push(cur.join('\n'));
-      cur = []; curLen = 0;
-    }
-    cur.push(line);
-    curLen += line.length + 1;
-  }
-  if (cur.length > 0) groups.push(cur.join('\n'));
-
   const card = {
     config: { wide_screen_mode: true },
-    elements: groups.map(g => ({ tag: 'div', text: { content: g, tag: 'lark_md' } })),
+    elements: buildCardElements(markdown),
   };
 
   try {
